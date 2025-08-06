@@ -27,6 +27,7 @@ import { db } from "./config/db.config.js";
 import { User } from './models/user.model.js';
 import CFA from './models/cfa.model.js';
 import { cfaAgentRouter } from "./route/agentCFA.route.js";
+import { loginOwner } from "./controller/ownerController.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -60,11 +61,11 @@ app.use("/api", credentialRoutes); // Credential issuance routes
 // New endpoint to get proof results
 app.get("/api/proof-results/:threadId", (req, res) => {
   const { threadId } = req.params;
-  
+
   if (!isValidThreadId(threadId)) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       status: "error",
-      error: "Invalid thread ID format" 
+      error: "Invalid thread ID format"
     });
   }
 
@@ -76,24 +77,24 @@ app.get("/api/proof-results/:threadId", (req, res) => {
 
   const result = proofResults.get(threadId);
   console.log(`Proof result for threadId ${threadId}:`, result ? 'FOUND' : 'NOT FOUND');
-  
+
   if (!result) {
     const isPending = pendingRequests.has(threadId);
     if (!isPending) {
       console.log(`❌ No pending request found for threadId: ${threadId}`);
-      return res.status(404).json({ 
+      return res.status(404).json({
         status: "error",
-        error: "Proof result not found" 
+        error: "Proof result not found"
       });
     }
     console.log(`⏳ Request is pending for threadId: ${threadId}`);
-    return res.status(202).json({ 
+    return res.status(202).json({
       status: "pending",
       message: "Proof verification in progress",
       threadId: threadId
     });
   }
-  
+
   console.log(`✅ Found result for threadId: ${threadId}`);
 
   return res.json({
@@ -104,12 +105,15 @@ app.get("/api/proof-results/:threadId", (req, res) => {
     verified: result.verified,
     userData: result.userData,
     cfaData: result.cfaData,
+    ownerData: result.ownerData, // Add this line
     holderDID: result.holderDID,
     forRelationship: result.forRelationship,
     isExistingUser: result.isExistingUser,
     isRegisteredAgent: result.isRegisteredAgent,
+    isRegisteredOwner: result.isRegisteredOwner, // Add this line
     timestamp: result.timestamp,
-    error: result.error
+    error: result.error,
+    type: result.type // Add this to distinguish between agent and owner
   });
 });
 
@@ -128,7 +132,7 @@ app.post("/webhook", async (req, res) => {
     if (body.type === "present-proof/presentation-result") {
       if (processedWebhooks.has(body.thid)) {
         console.log(`\nSkipping duplicate webhook for thread ID: ${body.thid}`);
-        return res.status(200).json({ 
+        return res.status(200).json({
           status: "success",
           message: "Webhook already processed"
         });
@@ -140,7 +144,7 @@ app.post("/webhook", async (req, res) => {
 
       if (body.requested_presentation && body.requested_presentation.revealed_attrs) {
         const revealedAttrs = body.requested_presentation.revealed_attrs;
-        
+
         // Check if this is a CFA agent verification
         if (revealedAttrs["License No."] && revealedAttrs["CFA Name"] && revealedAttrs["CFA Employee CID"]) {
           const cfaLicense = revealedAttrs["License No."][0].value;
@@ -148,7 +152,7 @@ app.post("/webhook", async (req, res) => {
           const employeeCID = revealedAttrs["CFA Employee CID"][0].value;
 
           console.log('Processing CFA agent verification:', { cfaLicense, cfaName, employeeCID });
-          
+
           // Find our threadId from the mapping
           let ourThreadId = null;
           for (const [key, value] of threadIdMapping.entries()) {
@@ -184,7 +188,7 @@ WHERE
 GROUP BY 
   c.id, c.cfa_license, c.cfa_name, c.employee_details;
             `;
-            
+
             const cfaResult = await db.query(cfaQuery, [cfaLicense, cfaName]);
             const existingCFA = cfaResult.rows[0];
             console.log('CFA Query Result:', existingCFA);
@@ -192,13 +196,14 @@ GROUP BY
             if (existingCFA) {
               // Check if the employee exists in the CFA's employee_details
               const employee = existingCFA.employees.find(emp => emp.cid === employeeCID);
-              
+
               if (employee) {
                 console.log('Found employee in CFA:', employee);
                 const proofResult = {
                   status: "success",
                   message: "CFA agent verified successfully",
                   verification_result: body.verification_result,
+                  type: "agent",
                   verified: true,
                   userData: {
                     Name: employee.name || '',
@@ -218,9 +223,11 @@ GROUP BY
                   forRelationship: body.relationship_did,
                   timestamp: new Date().toISOString(),
                   isExistingUser: true,
-                  isRegisteredAgent: true
+                  isRegisteredAgent: true,
+
+
                 };
-                
+
                 console.log('Storing proof result for CFA agent:', proofResult);
                 proofResults.set(ourThreadId, proofResult);
                 pendingRequests.delete(ourThreadId);
@@ -229,7 +236,7 @@ GROUP BY
                   isExistingUser: true
                 });
 
-                return res.status(200).json({ 
+                return res.status(200).json({
                   status: "success",
                   message: "CFA agent verified",
                   threadId: ourThreadId,
@@ -237,7 +244,7 @@ GROUP BY
                 });
               }
             }
-            
+
             // If we get here, either CFA or employee wasn't found
             const errorResult = {
               status: "error",
@@ -250,11 +257,11 @@ GROUP BY
               isExistingUser: false,
               isRegisteredAgent: false
             };
-            
+
             proofResults.set(ourThreadId, errorResult);
             pendingRequests.delete(ourThreadId);
-            
-            return res.status(200).json({ 
+
+            return res.status(200).json({
               status: "error",
               message: "Not a registered CFA agent",
               threadId: ourThreadId,
@@ -265,12 +272,13 @@ GROUP BY
             return res.status(500).json({ error: "Failed to process CFA agent verification" });
           }
         }
-        
-        // Regular user verification
-        const userName = revealedAttrs["Full Name"]?.[0]?.value;
-        const idNumber = revealedAttrs["ID Number"]?.[0]?.value;
 
-        if (!userName || !idNumber) {
+        // Regular user verification
+        const username = revealedAttrs["Full Name"]?.[0]?.value;
+        const cid = revealedAttrs["ID Number"]?.[0]?.value;
+        console.log('Processing regular user verification:', { username, cid });
+
+        if (!username || !cid) {
           return res.status(400).json({ error: "Name or ID not found in revealed attributes" });
         }
 
@@ -290,55 +298,66 @@ GROUP BY
 
         try {
           // Check if employee exists in any CFA
-          const existingCFA = await CFA.findByEmployeeDetails(userName, idNumber);
-          
-          // Mark this webhook as processed
-          processedWebhooks.set(body.thid, {
-            timestamp: new Date().toISOString(),
-            isExistingUser: !!existingCFA,
-            cfaDetails: existingCFA ? {
-              cfa_license: existingCFA.cfa_license,
-              cfa_name: existingCFA.cfa_name
-            } : null
-          });
+          // const existingCFA = await CFA.findByEmployeeDetails(userName, idNumber);
+          const existingOwner = await loginOwner({ username, cid })
 
-          if (existingCFA) {
-            console.log(`Found CFA employee in: ${existingCFA.cfa_name} (${existingCFA.cfa_license})`);
-            
-            // Store result for existing CFA employee
+          console.log('Existing owner:', existingOwner);
+          // Mark this webhook as processed
+          // processedWebhooks.set(body.thid, {
+          //   timestamp: new Date().toISOString(),
+          //   isExistingUser: !!existingCFA,
+          //   cfaDetails: existingCFA ? {
+          //     cfa_license: existingCFA.cfa_license,
+          //     cfa_name: existingCFA.cfa_name
+          //   } : null
+          // });
+
+          // Updated webhook handler section for owner login
+          if (existingOwner) {
+            console.log(`Found owner: ${existingOwner.owner.username} (${existingOwner.owner.business_license})`);
+
+            // Store result with consistent structure that matches the polling endpoint
             const proofResult = {
               status: "success",
-              message: "Employee found in CFA records",
+              message: "Owner login successful",
               verification_result: body.verification_result,
-              verified: true, // Add this for frontend polling
+              type: "owner",
+              verified: true,
               userData: {
-                Name: userName,
-                ID: idNumber,
-                role: 'agent',
-                cfa: {
-                  license: existingCFA.cfa_license,
-                  name: existingCFA.cfa_name
-                }
+                Name: existingOwner.owner.Name,
+                ID: existingOwner.owner.ID,
+                role: 'owner',
+                username: existingOwner.owner.username,
+                business_license: existingOwner.owner.business_license,
+                token: existingOwner.owner.token
               },
-              cfaData: { // Add cfaData for frontend
-                license: existingCFA.cfa_license,
-                name: existingCFA.cfa_name,
-                employeeId: existingCFA.employees.find(emp => emp.cid === idNumber)?.employee_id || idNumber
+              ownerData: {
+                ID: existingOwner.owner.ID,
+                Name: existingOwner.owner.Name,
+                business_license: existingOwner.owner.business_license,
+                username: existingOwner.owner.username,
+                token: existingOwner.owner.token
               },
               holderDID: body.holder_did,
               forRelationship: body.relationship_did,
               timestamp: new Date().toISOString(),
               isExistingUser: true,
-              isRegisteredAgent: true
+              isRegisteredOwner: true
             };
-            
-            console.log('Storing proof result for existing CFA employee:', proofResult);
+
+            console.log('Storing proof result for owner:', proofResult);
             proofResults.set(ourThreadId, proofResult);
             pendingRequests.delete(ourThreadId);
 
-            return res.status(200).json({ 
+            // Mark this webhook as processed
+            processedWebhooks.set(body.thid, {
+              timestamp: new Date().toISOString(),
+              isExistingUser: true
+            });
+
+            return res.status(200).json({
               status: "success",
-              message: "CFA employee verified",
+              message: "Owner verified",
               threadId: ourThreadId,
               proofResult: proofResult
             });
@@ -361,12 +380,12 @@ GROUP BY
               isExistingUser: false,
               isRegisteredAgent: false
             };
-            
+
             console.log('Storing proof result for non-CFA user:', proofResult);
             proofResults.set(ourThreadId, proofResult);
             pendingRequests.delete(ourThreadId);
 
-            return res.status(200).json({ 
+            return res.status(200).json({
               status: "error",
               message: "Not a registered CFA agent",
               threadId: ourThreadId,
@@ -375,7 +394,7 @@ GROUP BY
           }
         } catch (error) {
           console.error("Error processing user:", error);
-          
+
           // Store error result
           const errorResult = {
             status: "error",
@@ -385,10 +404,10 @@ GROUP BY
             error: "Failed to process user verification",
             timestamp: new Date().toISOString()
           };
-          
+
           proofResults.set(ourThreadId, errorResult);
           pendingRequests.delete(ourThreadId);
-          
+
           return res.status(500).json({ error: "Failed to process user" });
         }
       }
@@ -435,7 +454,7 @@ const server = app.listen(PORT, async () => {
       addr: PORT,
     });
     console.log(`ngrok tunnel established: ${ngrokUrlGlobal}`);
-    
+
     await registerWebhook(ngrokUrlGlobal);
     console.log("Webhook registered successfully.");
   } catch (err) {
@@ -448,12 +467,12 @@ const server = app.listen(PORT, async () => {
 // Graceful shutdown
 const shutdown = async (signal) => {
   console.log(`Received ${signal}. Starting graceful shutdown...`);
-  
+
   try {
     // Kill ngrok tunnel
     await ngrok.kill();
     console.log('Ngrok tunnel closed');
-    
+
     // Close server
     server.close(() => {
       console.log('Server closed');
