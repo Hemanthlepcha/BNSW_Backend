@@ -171,22 +171,22 @@ app.post("/webhook", async (req, res) => {
             // Check if the CFA exists using direct database query
             const cfaQuery = `
               SELECT 
-  c.*,
-  json_agg(
-    json_build_object(
-      'cid', e->>'cid',
-      'name', e->>'name',
-      'employee_id', e->>'employee_id'
-    )
-  ) AS employees
-FROM 
-  cfa c,
-  json_array_elements(c.employee_details::json) e  -- Cast JSONB to JSON
-WHERE 
-  c.cfa_license = $1 
-  AND c.cfa_name = $2
-GROUP BY 
-  c.id, c.cfa_license, c.cfa_name, c.employee_details;
+                  c.*,
+                  json_agg(
+                    json_build_object(
+                      'cid', e->>'cid',
+                      'name', e->>'name',
+                      'employee_id', e->>'employee_id'
+                    )
+                  ) AS employees
+                FROM 
+                  cfa c,
+                  json_array_elements(c.employee_details::json) e  -- Cast JSONB to JSON
+                WHERE 
+                  c.cfa_license = $1 
+                  AND c.cfa_name = $2
+                GROUP BY 
+                  c.id, c.cfa_license, c.cfa_name, c.employee_details;
             `;
 
             const cfaResult = await db.query(cfaQuery, [cfaLicense, cfaName]);
@@ -297,27 +297,22 @@ GROUP BY
         }
 
         try {
-          // Check if employee exists in any CFA
-          // const existingCFA = await CFA.findByEmployeeDetails(userName, idNumber);
-          const existingOwner = await loginOwner({ username, cid })
+          // Check both CFA employee and owner status
+          const [existingCFA, existingOwner] = await Promise.all([
+            CFA.findByEmployeeDetails(username, cid),
+            loginOwner({ username, cid })
+          ]);
 
+          console.log('Existing CFA:', existingCFA);
           console.log('Existing owner:', existingOwner);
-          // Mark this webhook as processed
-          // processedWebhooks.set(body.thid, {
-          //   timestamp: new Date().toISOString(),
-          //   isExistingUser: !!existingCFA,
-          //   cfaDetails: existingCFA ? {
-          //     cfa_license: existingCFA.cfa_license,
-          //     cfa_name: existingCFA.cfa_name
-          //   } : null
-          // });
 
-          // Updated webhook handler section for owner login
+          // Determine user type and create appropriate response
+          let proofResult;
+
           if (existingOwner) {
+            // Handle owner login
             console.log(`Found owner: ${existingOwner.owner.username} (${existingOwner.owner.business_license})`);
-
-            // Store result with consistent structure that matches the polling endpoint
-            const proofResult = {
+            proofResult = {
               status: "success",
               message: "Owner login successful",
               verification_result: body.verification_result,
@@ -344,54 +339,75 @@ GROUP BY
               isExistingUser: true,
               isRegisteredOwner: true
             };
-
-            console.log('Storing proof result for owner:', proofResult);
-            proofResults.set(ourThreadId, proofResult);
-            pendingRequests.delete(ourThreadId);
-
-            // Mark this webhook as processed
-            processedWebhooks.set(body.thid, {
-              timestamp: new Date().toISOString(),
-              isExistingUser: true
-            });
-
-            return res.status(200).json({
+          } else if (existingCFA) {
+            // Handle CFA employee login
+            console.log(`Found CFA employee: ${username} (${existingCFA.cfa_license})`);
+            proofResult = {
               status: "success",
-              message: "Owner verified",
-              threadId: ourThreadId,
-              proofResult: proofResult
-            });
-          } else {
-            // Not a CFA employee
-            console.log(`User ${userName} (${idNumber}) is not a registered CFA employee`);
-
-            const proofResult = {
-              status: "error",
-              message: "Not a registered CFA agent",
+              message: "CFA employee login successful",
               verification_result: body.verification_result,
-              verified: true, // Still verified, but not a CFA employee
-              error: "Not a registered CFA agent", // Add error for frontend
+              type: "cfa_employee",
+              verified: true,
+              cfaData: {
+                Name: username,
+                ID: cid,
+                role: 'cfa_employee',
+                cfa_license: existingCFA.cfa_license,
+                cfa_name: existingCFA.cfa_name
+              },
+              cfaDetails: {
+                cfa_license: existingCFA.cfa_license,
+                cfa_name: existingCFA.cfa_name
+              },
+              holderDID: body.holder_did,
+              forRelationship: body.relationship_did,
+              timestamp: new Date().toISOString(),
+              isExistingUser: true,
+              isRegisteredAgent: true
+            };
+          } else {
+            // Neither CFA employee nor owner
+            console.log(`User ${username} (${cid}) is not a registered user`);
+            proofResult = {
+              status: "error",
+              message: "Not a registered user",
+              verification_result: body.verification_result,
+              verified: true,
+              error: "Not a registered user",
               userData: {
-                Name: userName,
-                ID: idNumber,
+                Name: username,
+                ID: cid,
                 role: 'unregistered'
               },
               timestamp: new Date().toISOString(),
               isExistingUser: false,
-              isRegisteredAgent: false
+              isRegisteredAgent: false,
+              isRegisteredOwner: false
             };
-
-            console.log('Storing proof result for non-CFA user:', proofResult);
-            proofResults.set(ourThreadId, proofResult);
-            pendingRequests.delete(ourThreadId);
-
-            return res.status(200).json({
-              status: "error",
-              message: "Not a registered CFA agent",
-              threadId: ourThreadId,
-              proofResult: proofResult
-            });
           }
+
+          console.log('Storing proof result:', proofResult);
+          proofResults.set(ourThreadId, proofResult);
+          pendingRequests.delete(ourThreadId);
+
+          // Mark this webhook as processed
+          processedWebhooks.set(body.thid, {
+            timestamp: new Date().toISOString(),
+            isExistingUser: !!(existingCFA || existingOwner),
+            userType: existingOwner ? 'owner' : existingCFA ? 'cfa_employee' : 'unregistered',
+            cfaDetails: existingCFA ? {
+              cfa_license: existingCFA.cfa_license,
+              cfa_name: existingCFA.cfa_name
+            } : null
+          });
+
+          return res.status(200).json({
+            status: proofResult.status,
+            message: proofResult.message,
+            threadId: ourThreadId,
+            proofResult: proofResult
+          });
+
         } catch (error) {
           console.error("Error processing user:", error);
 
